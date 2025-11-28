@@ -207,57 +207,87 @@ __global__ void barnes_hut_traverse(
 __global__ void refit_bvh_bottom_up(
     const int* __restrict__ left_child,
     const int* __restrict__ right_child,
-    float* const* bbox_min,       // [3] arrays: bbox_min[0][node] = min_x, etc.
-    float* const* bbox_max,       // [3]
-    float* const* center,         // [3] center of mass
+    float** bbox_min,       // [3] arrays: bbox_min[0][node] = min_x, etc.
+    float** bbox_max,       // [3]
+    float** center,         // [3] center of mass
     float* node_mass,
     int nBodies)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies - 1) return;  // nBodies-1 internal nodes
 
-    // Total number of internal nodes = nBodies - 1
-    // They are stored in indices [nBodies, 2*nBodies-2]
-    int internal_idx = nBodies + idx;
-    if (idx >= nBodies - 1) return;
+    int internal_idx = nBodies + idx;  // Internal nodes are at [nBodies, 2*nBodies-2]
 
     // Get children
     int l = left_child[internal_idx];
     int r = right_child[internal_idx];
 
-    // Decode whether child is leaf or internal
-    bool l_is_leaf = (l < 0);
-    bool r_is_leaf = (r < 0);
+    float l_mass = 0.0f, r_mass = 0.0f;
+    float3 l_min = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
+    float3 l_max = make_float3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    float3 r_min = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
+    float3 r_max = make_float3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    float3 l_com = make_float3(0.0f, 0.0f, 0.0f);
+    float3 r_com = make_float3(0.0f, 0.0f, 0.0f);
 
-    int child_l_idx = l_is_leaf ? ~l : l;
-    int child_r_idx = r_is_leaf ? ~r : r;
+    // Get device pointers from the global device variables
+    extern __device__ float* d_bbox_min_ptrs[3];
+    extern __device__ float* d_bbox_max_ptrs[3];
+    extern __device__ float* d_center_ptrs[3];
 
-    // Load left child's data
-    float3 l_min = make_float3(bbox_min[0][child_l_idx],
-                               bbox_min[1][child_l_idx],
-                               bbox_min[2][child_l_idx]);
-    float3 l_max = make_float3(bbox_max[0][child_l_idx],
-                               bbox_max[1][child_l_idx],
-                               bbox_max[2][child_l_idx]);
-    float3 l_com = make_float3(center[0][child_l_idx],
-                               center[1][child_l_idx],
-                               center[2][child_l_idx]);
-    float  l_mass = node_mass[child_l_idx];
-
-    // Load right child's data
-    float3 r_min = make_float3(bbox_min[0][child_r_idx],
-                               bbox_min[1][child_r_idx],
-                               bbox_min[2][child_r_idx]);
-    float3 r_max = make_float3(bbox_max[0][child_r_idx],
-                               bbox_max[1][child_r_idx],
-                               bbox_max[2][child_r_idx]);
-    float3 r_com = make_float3(center[0][child_r_idx],
-                               center[1][child_r_idx],
-                               center[2][child_r_idx]);
-    float  r_mass = node_mass[child_r_idx];
+    if (l != -1) {
+        int child_l_idx = l; // Use direct index
+        l_min = make_float3(
+            d_bbox_min_ptrs[0][child_l_idx],
+            d_bbox_min_ptrs[1][child_l_idx],
+            d_bbox_min_ptrs[2][child_l_idx]
+        );
+        l_max = make_float3(
+            d_bbox_max_ptrs[0][child_l_idx],
+            d_bbox_max_ptrs[1][child_l_idx],
+            d_bbox_max_ptrs[2][child_l_idx]
+        );
+        l_com = make_float3(
+            d_center_ptrs[0][child_l_idx],
+            d_center_ptrs[1][child_l_idx],
+            d_center_ptrs[2][child_l_idx]
+        );
+        l_mass = node_mass[child_l_idx];
+    }
+    
+    // --- Conditionally Load Right Child Data ---
+    if (r != -1) {
+        int child_r_idx = r; // Use direct index
+        r_min = make_float3(
+            d_bbox_min_ptrs[0][child_r_idx],
+            d_bbox_min_ptrs[1][child_r_idx],
+            d_bbox_min_ptrs[2][child_r_idx]
+        );
+        r_max = make_float3(
+            d_bbox_max_ptrs[0][child_r_idx],
+            d_bbox_max_ptrs[1][child_r_idx],
+            d_bbox_max_ptrs[2][child_r_idx]
+        );
+        r_com = make_float3(
+            d_center_ptrs[0][child_r_idx],
+            d_center_ptrs[1][child_r_idx],
+            d_center_ptrs[2][child_r_idx]
+        );
+        r_mass = node_mass[child_r_idx];
+    }
 
     // === Merge AABBs ===
-    float3 node_min = fminf(l_min, r_min);
-    float3 node_max = fmaxf(l_max, r_max);
+    float3 node_min = make_float3(
+        fminf(l_min.x, r_min.x),
+        fminf(l_min.y, r_min.y),
+        fminf(l_min.z, r_min.z)
+    );
+    
+    float3 node_max = make_float3(
+        fmaxf(l_max.x, r_max.x),
+        fmaxf(l_max.y, r_max.y),
+        fmaxf(l_max.z, r_max.z)
+    );
 
     // === Compute total mass and center of mass ===
     float total_mass = l_mass + r_mass;
@@ -270,43 +300,43 @@ __global__ void refit_bvh_bottom_up(
     );
 
     // === Write back to this internal node ===
-    bbox_min[0][internal_idx] = node_min.x;
-    bbox_min[1][internal_idx] = node_min.y;
-    bbox_min[2][internal_idx] = node_min.z;
+    d_bbox_min_ptrs[0][internal_idx] = node_min.x;
+    d_bbox_min_ptrs[1][internal_idx] = node_min.y;
+    d_bbox_min_ptrs[2][internal_idx] = node_min.z;
 
-    bbox_max[0][internal_idx] = node_max.x;
-    bbox_max[1][internal_idx] = node_max.y;
-    bbox_max[2][internal_idx] = node_max.z;
+    d_bbox_max_ptrs[0][internal_idx] = node_max.x;
+    d_bbox_max_ptrs[1][internal_idx] = node_max.y;
+    d_bbox_max_ptrs[2][internal_idx] = node_max.z;
 
-    center[0][internal_idx] = node_com.x;
-    center[1][internal_idx] = node_com.y;
-    center[2][internal_idx] = node_com.z;
+    d_center_ptrs[0][internal_idx] = node_com.x;
+    d_center_ptrs[1][internal_idx] = node_com.y;
+    d_center_ptrs[2][internal_idx] = node_com.z;
 
     node_mass[internal_idx] = total_mass;
 }
 
 __global__ void compute_leaf_aabbs_and_com(
-    float* const* sorted_pos,
-    float* const* bbox_min,
-    float* const* bbox_max,
-    float* const* center,
+    const float* px, const float* py, const float* pz,
+    float* min_x, float* min_y, float* min_z,
+    float* max_x, float* max_y, float* max_z,
+    float* com_x, float* com_y, float* com_z,
     float* node_mass,
     int nBodies)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nBodies) return;
 
-    float px = sorted_pos[0][i];
-    float py = sorted_pos[1][i];
-    float pz = sorted_pos[2][i];
+    float x = px[i];
+    float y = py[i];
+    float z = pz[i];
 
-    bbox_min[0][i] = px;  bbox_max[0][i] = px;
-    bbox_min[1][i] = py;  bbox_max[1][i] = py;
-    bbox_min[2][i] = pz;  bbox_max[2][i] = pz;
+    min_x[i] = max_x[i] = x;
+    min_y[i] = max_y[i] = y;
+    min_z[i] = max_z[i] = z;
 
-    center[0][i] = px;
-    center[1][i] = py;
-    center[2][i] = pz;
+    com_x[i] = x;
+    com_y[i] = y;
+    com_z[i] = z;
 
     node_mass[i] = 1.0f;
 }
@@ -415,11 +445,29 @@ __global__ void build_lbvh_radix_tree(
     // Step 2: Find split point
     int split = find_split(first, last, morton_codes, nBodies);
 
-    // Step 3: Assign children (NO negative numbers, NO bit-flipping!)
-    int child_L = (split == first) ? split : nBodies + split;           // leaf or internal
-    int child_R = (split + 1 == last) ? last : nBodies + (split + 1);   // leaf or internal
+    // Step 3: Assign children
+    int child_L, child_R;
+    
+    // Left child
+    if (split == first) {
+        child_L = first;  // leaf
+    } else {
+        // Find the internal node that covers [first, split]
+        int left_internal = split - 1;
+        child_L = nBodies + left_internal;
+    }
+    
+    // Right child
+    if (split + 1 == last) {
+        child_R = last;  // leaf
+    } else {
+        // Find the internal node that covers [split+1, last]
+        int right_internal = split;
+        child_R = nBodies + right_internal;
+    }
 
-    left_child[internal_idx]  = child_L;
+    // Store children
+    left_child[internal_idx] = child_L;
     right_child[internal_idx] = child_R;
 }
 
@@ -540,17 +588,35 @@ void lbvh_timestep(
     }
 
     // === 5. Build tree on sorted particles ===
-    build_lbvh_radix_tree<<<grid, block>>>(morton, parent, left, right, nBodies);
+    build_lbvh_radix_tree<<<grid, block>>>(
+        morton,
+        left, right, 
+        nBodies
+    );
 		CHECK_LAST_CUDA_ERROR();
 
     // === 6. Leaf AABBs and center of mass ===
     // Assuming unit mass (1.0f)
-    compute_leaf_aabbs_and_com<<<grid, block>>>(sorted_pos, nullptr, bbox_min, bbox_max, center, node_mass, nBodies);
-		CHECK_LAST_CUDA_ERROR();
+    compute_leaf_aabbs_and_com<<<grid, block>>>(
+        sorted_pos[0], sorted_pos[1], sorted_pos[2],
+        bbox_min[0], bbox_min[1], bbox_min[2],
+        bbox_max[0], bbox_max[1], bbox_max[2],
+        center[0],   center[1],   center[2],
+        node_mass,
+        nBodies
+    );
+    CHECK_LAST_CUDA_ERROR();
 
     // === 7. Refit internal nodes ===
-    refit_bvh_bottom_up<<<grid, block>>>(left, right, bbox_min, bbox_max, center, node_mass, nBodies);
-		CHECK_LAST_CUDA_ERROR();
+    int numInternalNodes = nBodies - 1;
+    dim3 grid_refit((numInternalNodes + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    printf("Launching refit_bvh_bottom_up with grid=(%d,1,1), block=(%d,1,1), nBodies=%d\n", 
+           grid_refit.x, block.x, nBodies);
+    
+    // The actual pointers are now managed by the device variables, so we can pass NULL
+    // for the pointer arrays since they won't be used
+    refit_bvh_bottom_up<<<grid_refit, block>>>(left, right, NULL, NULL, NULL, node_mass, nBodies);
+    CHECK_LAST_CUDA_ERROR();
 
     // === 8. Force calculation (on sorted particles) ===
     barnes_hut_traverse<<<grid, block>>>(
@@ -595,22 +661,78 @@ void allocate_bvh_arrays(
     cudaMalloc(left, node_bytes);
     cudaMalloc(right, node_bytes);
     
+    // Initialize parent array to -1 (convention: root has no parent)
+    cudaMemset(*parent, -1, node_bytes);
+    
+    // Initialize left and right to -1
+    cudaMemset(*left, -1, node_bytes);
+    cudaMemset(*right, -1, node_bytes);
+    
     // Bounding boxes (min and max for x, y, z)
-    for (int d = 0; d < 3; d++) {
-        cudaMalloc(&bbox_min[d], node_bytes_float);
-        cudaMalloc(&bbox_max[d], node_bytes_float);
-    }
+    float *d_bbox_min_x, *d_bbox_min_y, *d_bbox_min_z;
+    float *d_bbox_max_x, *d_bbox_max_y, *d_bbox_max_z;
+    float *d_center_x, *d_center_y, *d_center_z;
+    
+    cudaMalloc(&d_bbox_min_x, node_bytes_float);
+    cudaMalloc(&d_bbox_min_y, node_bytes_float);
+    cudaMalloc(&d_bbox_min_z, node_bytes_float);
+    
+    cudaMalloc(&d_bbox_max_x, node_bytes_float);
+    cudaMalloc(&d_bbox_max_y, node_bytes_float);
+    cudaMalloc(&d_bbox_max_z, node_bytes_float);
     
     // Center of mass (x, y, z)
-    for (int d = 0; d < 3; d++) {
-        cudaMalloc(&center[d], node_bytes_float);
-    }
+    cudaMalloc(&d_center_x, node_bytes_float);
+    cudaMalloc(&d_center_y, node_bytes_float);
+    cudaMalloc(&d_center_z, node_bytes_float);
+    
+    // Initialize device pointer arrays
+    init_device_pointers<<<1, 1>>>(
+        d_bbox_min_x, d_bbox_min_y, d_bbox_min_z,
+        d_bbox_max_x, d_bbox_max_y, d_bbox_max_z,
+        d_center_x, d_center_y, d_center_z);
+    cudaDeviceSynchronize();
+    
+    // Set host pointers for backward compatibility
+    bbox_min[0] = d_bbox_min_x;
+    bbox_min[1] = d_bbox_min_y;
+    bbox_min[2] = d_bbox_min_z;
+    
+    bbox_max[0] = d_bbox_max_x;
+    bbox_max[1] = d_bbox_max_y;
+    bbox_max[2] = d_bbox_max_z;
+    
+    center[0] = d_center_x;
+    center[1] = d_center_y;
+    center[2] = d_center_z;
     
     // Total mass at each node
     cudaMalloc(node_mass, node_bytes_float);
+    cudaMemset(*node_mass, 0, node_bytes_float);
+}
+
+// Device pointers for the arrays of pointers
+__device__ float* d_bbox_min_ptrs[3];
+__device__ float* d_bbox_max_ptrs[3];
+__device__ float* d_center_ptrs[3];
+
+// Initialize device pointer arrays
+__global__ void init_device_pointers(
+    float* bbox_min_x, float* bbox_min_y, float* bbox_min_z,
+    float* bbox_max_x, float* bbox_max_y, float* bbox_max_z,
+    float* center_x, float* center_y, float* center_z)
+{
+    d_bbox_min_ptrs[0] = bbox_min_x;
+    d_bbox_min_ptrs[1] = bbox_min_y;
+    d_bbox_min_ptrs[2] = bbox_min_z;
     
-    // Initialize parent array to -1 (convention: root has no parent)
-    cudaMemset(*parent, -1, node_bytes);
+    d_bbox_max_ptrs[0] = bbox_max_x;
+    d_bbox_max_ptrs[1] = bbox_max_y;
+    d_bbox_max_ptrs[2] = bbox_max_z;
+    
+    d_center_ptrs[0] = center_x;
+    d_center_ptrs[1] = center_y;
+    d_center_ptrs[2] = center_z;
 }
 
 int main(const int argc, const char** argv) {
@@ -676,9 +798,13 @@ int main(const int argc, const char** argv) {
     // BVH node arrays (2N-1 nodes total)
     int    *d_parent, *d_left, *d_right;
     float  *d_bbox_min[3], *d_bbox_max[3];
-    float  *d_mass, *d_center[3];
-    allocate_bvh_arrays(&d_parent, &d_left, &d_right,
-                        d_bbox_min, d_bbox_max, d_mass, d_center, nBodies);
+    float  *d_mass = nullptr, *d_center[3];
+    allocate_bvh_arrays(
+        &d_parent, &d_left, &d_right,
+        d_bbox_min, d_bbox_max,
+        &d_mass, d_center,
+        nBodies
+    );
 
     // Copy initial data to device
     for(int d = 0; d < 3; d++) {

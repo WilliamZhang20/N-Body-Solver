@@ -10,3 +10,30 @@ Problem: plot the motion of $n$ unit masses in 3D space due to their inter-gravi
 The BVH implementation is by far the hardest, longest, but most interesting and theory-heavy implementation.
 
 Closely mirrors radix-tree implementation in [this](https://research.nvidia.com/sites/default/files/pubs/2012-06_Maximizing-Parallelism-in/karras2012hpg_paper.pdf) 2012 paper by Tero Karras.
+
+## Getting Started
+
+To compile, run:
+```Bash
+nvcc -std=c++14 -o nbody 09-nbody/01-nbody.cu
+```
+
+To debug in Jupyter, run:
+```Bash
+%%writefile gdb_commands.txt
+# Set breakpoints at the start of your kernel and immediately before launch
+break refit_bvh_bottom_up
+break 09-nbody/01-nbody.cu:586
+handle SIGSEGV stop noprint
+handle SIGABRT stop noprint
+run
+continue
+continue
+# bt
+quit
+```
+
+To profile, run:
+```Bash
+nsys profile --stats=true --force-overwrite=true -o nbody-report ./nbody
+```
