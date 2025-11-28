@@ -99,9 +99,9 @@ bool node_needs_opening(const float3 pos, const float3 node_com,
 }
 
 __global__ void barnes_hut_traverse(
-    const float* const* sorted_pos,      // [3] x,y,z of sorted particles
-    const float* const* sorted_vel,      // not used here (but kept for symmetry)
-    float* const* sorted_force,          // [3] output forces (accumulated)
+    const float* const* sorted_pos,
+    const float* const* sorted_vel,
+    float* const* sorted_force,
     const int* __restrict__ left_child,
     const int* __restrict__ right_child,
     float* const* bbox_min,
@@ -114,61 +114,51 @@ __global__ void barnes_hut_traverse(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nBodies) return;
 
-    float4 my_pos_mass = make_float4(
-        sorted_pos[0][i],
-        sorted_pos[1][i],
-        sorted_pos[2][i],
-        1.0f);  // unit mass
+    float4 my_pos_mass = make_float4(sorted_pos[0][i],
+                                     sorted_pos[1][i],
+                                     sorted_pos[2][i], 1.0f);
 
     float3 acc = make_float3(0.0f, 0.0f, 0.0f);
 
-    // Start traversal from root
-    int root = nBodies;  // root is always at index nBodies
-
-    // Simple stack-less traversal (depth-first via loop)
-    int stack[32];
+    int stack[64];  // Increased from 32 → safe for 2^20 bodies
     int stack_size = 0;
-    stack[stack_size++] = root;
+    stack[stack_size++] = nBodies;  // root
 
     while (stack_size > 0) {
         int node_idx = stack[--stack_size];
 
-        // Decode children
         int l = left_child[node_idx];
         int r = right_child[node_idx];
 
         // Process left child
         if (l != -1) {
             bool is_leaf = (l < nBodies);
-						int child_idx = is_leaf ? ~l : l;
+            int child_idx = l;  // Direct index — no ~l !
 
             if (is_leaf) {
-                if (child_idx != i) {  // skip self-interaction
-                    float4 bj = make_float4(
-                        sorted_pos[0][child_idx],
-                        sorted_pos[1][child_idx],
-                        sorted_pos[2][child_idx],
-                        1.0f);
+                if (child_idx != i) {
+                    float4 bj = make_float4(sorted_pos[0][child_idx],
+                                            sorted_pos[1][child_idx],
+                                            sorted_pos[2][child_idx], 1.0f);
                     acc = body_body_interaction(acc, my_pos_mass, bj);
                 }
             } else {
-                float3 node_com = make_float3(center[0][child_idx],
-                                             center[1][child_idx],
-                                             center[2][child_idx]);
-                float3 node_min = make_float3(bbox_min[0][child_idx],
-                                             bbox_min[1][child_idx],
-                                             bbox_min[2][child_idx]);
-                float3 node_max = make_float3(bbox_max[0][child_idx],
-                                             bbox_max[1][child_idx],
-                                             bbox_max[2][child_idx]);
-                float node_m = node_mass[child_idx];
+                float3 com = make_float3(center[0][child_idx],
+                                         center[1][child_idx],
+                                         center[2][child_idx]);
+                float3 bmin = make_float3(bbox_min[0][child_idx],
+                                          bbox_min[1][child_idx],
+                                          bbox_min[2][child_idx]);
+                float3 bmax = make_float3(bbox_max[0][child_idx],
+                                          bbox_max[1][child_idx],
+                                          bbox_max[2][child_idx]);
+                float mass = node_mass[child_idx];
 
                 if (node_needs_opening(make_float3(my_pos_mass.x, my_pos_mass.y, my_pos_mass.z),
-                                       node_com, node_min, node_max, node_m, theta)) {
+                                       com, bmin, bmax, mass, theta)) {
                     stack[stack_size++] = child_idx;
                 } else {
-                    // Approximate: treat node as single body at CoM
-                    float4 bj = make_float4(node_com.x, node_com.y, node_com.z, node_m);
+                    float4 bj = make_float4(com.x, com.y, com.z, mass);
                     acc = body_body_interaction(acc, my_pos_mass, bj);
                 }
             }
@@ -176,42 +166,39 @@ __global__ void barnes_hut_traverse(
 
         // Process right child (same logic)
         if (r != -1) {
-            bool is_leaf = (r < 0);
-            int child_idx = is_leaf ? ~r : r;
+            bool is_leaf = (r < nBodies);
+            int child_idx = r;
 
             if (is_leaf) {
                 if (child_idx != i) {
-                    float4 bj = make_float4(
-                        sorted_pos[0][child_idx],
-                        sorted_pos[1][child_idx],
-                        sorted_pos[2][child_idx],
-                        1.0f);
+                    float4 bj = make_float4(sorted_pos[0][child_idx],
+                                            sorted_pos[1][child_idx],
+                                            sorted_pos[2][child_idx], 1.0f);
                     acc = body_body_interaction(acc, my_pos_mass, bj);
                 }
             } else {
-                float3 node_com = make_float3(center[0][child_idx],
-                                             center[1][child_idx],
-                                             center[2][child_idx]);
-                float3 node_min = make_float3(bbox_min[0][child_idx],
-                                             bbox_min[1][child_idx],
-                                             bbox_min[2][child_idx]);
-                float3 node_max = make_float3(bbox_max[0][child_idx],
-                                             bbox_max[1][child_idx],
-                                             bbox_max[2][child_idx]);
-                float node_m = node_mass[child_idx];
+                float3 com = make_float3(center[0][child_idx],
+                                         center[1][child_idx],
+                                         center[2][child_idx]);
+                float3 bmin = make_float3(bbox_min[0][child_idx],
+                                          bbox_min[1][child_idx],
+                                          bbox_min[2][child_idx]);
+                float3 bmax = make_float3(bbox_max[0][child_idx],
+                                          bbox_max[1][child_idx],
+                                          bbox_max[2][child_idx]);
+                float mass = node_mass[child_idx];
 
                 if (node_needs_opening(make_float3(my_pos_mass.x, my_pos_mass.y, my_pos_mass.z),
-                                       node_com, node_min, node_max, node_m, theta)) {
+                                       com, bmin, bmax, mass, theta)) {
                     stack[stack_size++] = child_idx;
                 } else {
-                    float4 bj = make_float4(node_com.x, node_com.y, node_com.z, node_m);
+                    float4 bj = make_float4(com.x, com.y, com.z, mass);
                     acc = body_body_interaction(acc, my_pos_mass, bj);
                 }
             }
         }
     }
 
-    // Write result
     sorted_force[0][i] = acc.x;
     sorted_force[1][i] = acc.y;
     sorted_force[2][i] = acc.z;
@@ -296,6 +283,32 @@ __global__ void refit_bvh_bottom_up(
     center[2][internal_idx] = node_com.z;
 
     node_mass[internal_idx] = total_mass;
+}
+
+__global__ void compute_leaf_aabbs_and_com(
+    float* const* sorted_pos,
+    float* const* bbox_min,
+    float* const* bbox_max,
+    float* const* center,
+    float* node_mass,
+    int nBodies)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nBodies) return;
+
+    float px = sorted_pos[0][i];
+    float py = sorted_pos[1][i];
+    float pz = sorted_pos[2][i];
+
+    bbox_min[0][i] = px;  bbox_max[0][i] = px;
+    bbox_min[1][i] = py;  bbox_max[1][i] = py;
+    bbox_min[2][i] = pz;  bbox_max[2][i] = pz;
+
+    center[0][i] = px;
+    center[1][i] = py;
+    center[2][i] = pz;
+
+    node_mass[i] = 1.0f;
 }
 
 __device__ int delta(int i, int j, const uint64_t* morton_codes, int n)
@@ -384,71 +397,30 @@ __device__ int find_split(int first, int last, const uint64_t* morton_codes, int
 
 __global__ void build_lbvh_radix_tree(
     const uint64_t* __restrict__ morton_codes,
-    int* parent,
     int* left_child,
     int* right_child,
     int nBodies)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nBodies - 1) return;  // Only need N-1 internal nodes
-    
-    // Internal node index
-    int internal_idx = nBodies + i;
-    
-    // 1. Determine range [first, last] that this internal node covers
-    int2 range = determine_range(morton_codes, nBodies, i);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies - 1) return;
+
+    // Each thread builds one internal node: index [nBodies ... 2*nBodies-2]
+    int internal_idx = nBodies + idx;
+
+    // Step 1: Determine range [first, last] this internal node covers
+    int2 range = determine_range(morton_codes, nBodies, idx);
     int first = range.x;
-    int last = range.y;
-    
-    // 2. Find split point
+    int last  = range.y;
+
+    // Step 2: Find split point
     int split = find_split(first, last, morton_codes, nBodies);
-    
-    // 3. Assign children
-    int child_L, child_R;
-    
-    // Left child
-    if (split == first) {
-        // Leaf node
-        child_L = split;
-    } else {
-        // Internal node: map particle index to internal node index
-        child_L = nBodies + split;
-    }
-    
-    // Right child
-    if (split + 1 == last) {
-        // Leaf node
-        child_R = last;
-    } else {
-        // Internal node
-        child_R = nBodies + split + 1;
-    }
-    
-    // 4. Write children
-    left_child[internal_idx] = child_L;
+
+    // Step 3: Assign children (NO negative numbers, NO bit-flipping!)
+    int child_L = (split == first) ? split : nBodies + split;           // leaf or internal
+    int child_R = (split + 1 == last) ? last : nBodies + (split + 1);   // leaf or internal
+
+    left_child[internal_idx]  = child_L;
     right_child[internal_idx] = child_R;
-    
-    // 5. Set parent pointers
-    if (child_L < nBodies) {
-        // Leaf node
-        parent[child_L] = internal_idx;
-    } else {
-        // Internal node
-        parent[child_L] = internal_idx;
-    }
-    
-    if (child_R < nBodies) {
-        // Leaf node
-        parent[child_R] = internal_idx;
-    } else {
-        // Internal node
-        parent[child_R] = internal_idx;
-    }
-    
-    // Root node (internal node 0 = index nBodies) has no parent
-    if (i == 0) {
-        parent[internal_idx] = -1;
-    }
 }
 
 __global__ void compute_morton_codes(
@@ -510,7 +482,7 @@ __global__ void compute_morton_codes(
     zz = (zz | (zz << 2))  & 0x1249249249249249ULL;
 
     // Combine into final 64-bit Morton code
-    morton[idx] = ((uint64_t)xx << 2) | ((uint64_t)yy << 1) | (uint64_t)zz;
+    morton[idx] = xx | (yy << 1) | (zz << 2);
 }
 
 void lbvh_timestep(
