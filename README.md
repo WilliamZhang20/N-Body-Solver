@@ -33,6 +33,18 @@ continue
 quit
 ```
 
+with:
+
+```Bash
+nvcc -g -lineinfo -std=c++14 -o nbody 09-nbody/01-nbody.cu
+```
+
+and:
+
+```Bash
+cuda-gdb -batch -x gdb_commands.txt --args ./nbody
+```
+
 To profile, run:
 ```Bash
 nsys profile --stats=true --force-overwrite=true -o nbody-report ./nbody

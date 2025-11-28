@@ -45,19 +45,20 @@ __global__ void integrate_leapfrog(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nBodies) return;
 
-    float ax = force[0][i];
-    float ay = force[1][i];
-    float az = force[2][i];
+    // Use device pointers
+    extern __device__ float* d_sorted_pos_ptrs[3];
+    extern __device__ float* d_sorted_vel_ptrs[3];
+    extern __device__ float* d_sorted_force_ptrs[3];
 
-    // v += a*dt
-    vel[0][i] += ax * dt;
-    vel[1][i] += ay * dt;
-    vel[2][i] += az * dt;
+    // Update velocity (v = v + a*dt)
+    d_sorted_vel_ptrs[0][i] += d_sorted_force_ptrs[0][i] * dt;
+    d_sorted_vel_ptrs[1][i] += d_sorted_force_ptrs[1][i] * dt;
+    d_sorted_vel_ptrs[2][i] += d_sorted_force_ptrs[2][i] * dt;
 
-    // p += v*dt  (velocity-verlet style)
-    pos[0][i] += vel[0][i] * dt;
-    pos[1][i] += vel[1][i] * dt;
-    pos[2][i] += vel[2][i] * dt;
+    // Update position (x = x + v*dt)
+    d_sorted_pos_ptrs[0][i] += d_sorted_vel_ptrs[0][i] * dt;
+    d_sorted_pos_ptrs[1][i] += d_sorted_vel_ptrs[1][i] * dt;
+    d_sorted_pos_ptrs[2][i] += d_sorted_vel_ptrs[2][i] * dt;
 }
 
 __device__ __forceinline__
@@ -99,24 +100,35 @@ bool node_needs_opening(const float3 pos, const float3 node_com,
 }
 
 __global__ void barnes_hut_traverse(
-    const float* const* sorted_pos,
-    const float* const* sorted_vel,
-    float* const* sorted_force,
-    const int* __restrict__ left_child,
-    const int* __restrict__ right_child,
-    float* const* bbox_min,
-    float* const* bbox_max,
+    const float* const* sorted_pos,   // Will be NULL, using device variables
+    const float* const* sorted_vel,   // Will be NULL, using device variables
+    float* const* sorted_force,       // Will be NULL, using device variables
+    const int* __restrict__ left,
+    const int* __restrict__ right,
+    float* const* bbox_min,           // Will be NULL, using device variables
+    float* const* bbox_max,           // Will be NULL, using device variables
     const float* __restrict__ node_mass,
-    float* const* center,
+    float* const* center,             // Will be NULL, using device variables
     int nBodies,
     float theta)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nBodies) return;
 
-    float4 my_pos_mass = make_float4(sorted_pos[0][i],
-                                     sorted_pos[1][i],
-                                     sorted_pos[2][i], 1.0f);
+    // Use device pointers instead of passed-in pointers
+    extern __device__ float* d_sorted_pos_ptrs[3];
+    extern __device__ float* d_sorted_vel_ptrs[3];
+    extern __device__ float* d_sorted_force_ptrs[3];
+    extern __device__ float* d_bbox_min_ptrs[3];
+    extern __device__ float* d_bbox_max_ptrs[3];
+    extern __device__ float* d_center_ptrs[3];
+
+    float4 my_pos_mass = make_float4(
+        d_sorted_pos_ptrs[0][i],
+        d_sorted_pos_ptrs[1][i],
+        d_sorted_pos_ptrs[2][i],
+        1.0f  // Assuming unit mass for now
+    );
 
     float3 acc = make_float3(0.0f, 0.0f, 0.0f);
 
@@ -126,82 +138,92 @@ __global__ void barnes_hut_traverse(
 
     while (stack_size > 0) {
         int node_idx = stack[--stack_size];
+        
+        // Skip if this is the current body
+        if (node_idx < nBodies && node_idx == i) continue;
 
-        int l = left_child[node_idx];
-        int r = right_child[node_idx];
+        // Check if this is a leaf node (particle)
+        if (node_idx < nBodies) {
+            // Leaf node - calculate direct force
+            float3 body_pos = make_float3(
+                d_sorted_pos_ptrs[0][node_idx],
+                d_sorted_pos_ptrs[1][node_idx],
+                d_sorted_pos_ptrs[2][node_idx]
+            );
 
-        // Process left child
-        if (l != -1) {
-            bool is_leaf = (l < nBodies);
-            int child_idx = l;  // Direct index — no ~l !
+            // Calculate distance between particles
+            float3 r = make_float3(
+                body_pos.x - my_pos_mass.x,
+                body_pos.y - my_pos_mass.y,
+                body_pos.z - my_pos_mass.z
+            );
 
-            if (is_leaf) {
-                if (child_idx != i) {
-                    float4 bj = make_float4(sorted_pos[0][child_idx],
-                                            sorted_pos[1][child_idx],
-                                            sorted_pos[2][child_idx], 1.0f);
-                    acc = body_body_interaction(acc, my_pos_mass, bj);
-                }
+            float distSqr = r.x * r.x + r.y * r.y + r.z * r.z + SOFTENING;
+            float invDist = rsqrtf(distSqr);
+            float invDist3 = invDist * invDist * invDist;
+
+            // Add contribution to acceleration
+            float s = 1.0f * invDist3;
+            acc.x += r.x * s;
+            acc.y += r.y * s;
+            acc.z += r.z * s;
+        } else {
+            // Internal node - check if we can approximate
+            float3 node_center = make_float3(
+                d_center_ptrs[0][node_idx - nBodies],
+                d_center_ptrs[1][node_idx - nBodies],
+                d_center_ptrs[2][node_idx - nBodies]
+            );
+
+            float3 node_size = make_float3(
+                d_bbox_max_ptrs[0][node_idx - nBodies] - d_bbox_min_ptrs[0][node_idx - nBodies],
+                d_bbox_max_ptrs[1][node_idx - nBodies] - d_bbox_min_ptrs[1][node_idx - nBodies],
+                d_bbox_max_ptrs[2][node_idx - nBodies] - d_bbox_min_ptrs[2][node_idx - nBodies]
+            );
+
+            float d = sqrtf(
+                (node_center.x - my_pos_mass.x) * (node_center.x - my_pos_mass.x) +
+                (node_center.y - my_pos_mass.y) * (node_center.y - my_pos_mass.y) +
+                (node_center.z - my_pos_mass.z) * (node_center.z - my_pos_mass.z)
+            );
+
+            float s = max(node_size.x, max(node_size.y, node_size.z));
+
+            // Check if we can approximate this node
+            if (s / d < theta) {
+                // Use center of mass approximation
+                float3 r = make_float3(
+                    node_center.x - my_pos_mass.x,
+                    node_center.y - my_pos_mass.y,
+                    node_center.z - my_pos_mass.z
+                );
+
+                float distSqr = r.x * r.x + r.y * r.y + r.z * r.z + SOFTENING;
+                float invDist = rsqrtf(distSqr);
+                float invDist3 = invDist * invDist * invDist;
+
+                // Add contribution to acceleration
+                float node_mass_val = node_mass[node_idx - nBodies];
+                float s = node_mass_val * invDist3;
+                acc.x += r.x * s;
+                acc.y += r.y * s;
+                acc.z += r.z * s;
             } else {
-                float3 com = make_float3(center[0][child_idx],
-                                         center[1][child_idx],
-                                         center[2][child_idx]);
-                float3 bmin = make_float3(bbox_min[0][child_idx],
-                                          bbox_min[1][child_idx],
-                                          bbox_min[2][child_idx]);
-                float3 bmax = make_float3(bbox_max[0][child_idx],
-                                          bbox_max[1][child_idx],
-                                          bbox_max[2][child_idx]);
-                float mass = node_mass[child_idx];
-
-                if (node_needs_opening(make_float3(my_pos_mass.x, my_pos_mass.y, my_pos_mass.z),
-                                       com, bmin, bmax, mass, theta)) {
-                    stack[stack_size++] = child_idx;
-                } else {
-                    float4 bj = make_float4(com.x, com.y, com.z, mass);
-                    acc = body_body_interaction(acc, my_pos_mass, bj);
-                }
-            }
-        }
-
-        // Process right child (same logic)
-        if (r != -1) {
-            bool is_leaf = (r < nBodies);
-            int child_idx = r;
-
-            if (is_leaf) {
-                if (child_idx != i) {
-                    float4 bj = make_float4(sorted_pos[0][child_idx],
-                                            sorted_pos[1][child_idx],
-                                            sorted_pos[2][child_idx], 1.0f);
-                    acc = body_body_interaction(acc, my_pos_mass, bj);
-                }
-            } else {
-                float3 com = make_float3(center[0][child_idx],
-                                         center[1][child_idx],
-                                         center[2][child_idx]);
-                float3 bmin = make_float3(bbox_min[0][child_idx],
-                                          bbox_min[1][child_idx],
-                                          bbox_min[2][child_idx]);
-                float3 bmax = make_float3(bbox_max[0][child_idx],
-                                          bbox_max[1][child_idx],
-                                          bbox_max[2][child_idx]);
-                float mass = node_mass[child_idx];
-
-                if (node_needs_opening(make_float3(my_pos_mass.x, my_pos_mass.y, my_pos_mass.z),
-                                       com, bmin, bmax, mass, theta)) {
-                    stack[stack_size++] = child_idx;
-                } else {
-                    float4 bj = make_float4(com.x, com.y, com.z, mass);
-                    acc = body_body_interaction(acc, my_pos_mass, bj);
-                }
+                // Need to process children
+                int l = left[node_idx];
+                int r = right[node_idx];
+                if (r != -1) stack[stack_size++] = r;
+                if (l != -1) stack[stack_size++] = l;
             }
         }
     }
 
-    sorted_force[0][i] = acc.x;
-    sorted_force[1][i] = acc.y;
-    sorted_force[2][i] = acc.z;
+    // Write the acceleration back to global memory
+    if (i < nBodies) {
+        d_sorted_force_ptrs[0][i] = acc.x;
+        d_sorted_force_ptrs[1][i] = acc.y;
+        d_sorted_force_ptrs[2][i] = acc.z;
+    }
 }
 
 __global__ void refit_bvh_bottom_up(
@@ -533,6 +555,55 @@ __global__ void compute_morton_codes(
     morton[idx] = xx | (yy << 1) | (zz << 2);
 }
 
+
+// Device pointers for the arrays of pointers
+__device__ float* d_bbox_min_ptrs[3];
+__device__ float* d_bbox_max_ptrs[3];
+__device__ float* d_center_ptrs[3];
+
+__device__ float* d_sorted_pos_ptrs[3];
+__device__ float* d_sorted_vel_ptrs[3];
+__device__ float* d_sorted_force_ptrs[3];
+
+__global__ void init_particle_pointers(
+    float* pos_x, float* pos_y, float* pos_z,
+    float* vel_x, float* vel_y, float* vel_z,
+    float* force_x, float* force_y, float* force_z)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        d_sorted_pos_ptrs[0] = pos_x;
+        d_sorted_pos_ptrs[1] = pos_y;
+        d_sorted_pos_ptrs[2] = pos_z;
+        
+        d_sorted_vel_ptrs[0] = vel_x;
+        d_sorted_vel_ptrs[1] = vel_y;
+        d_sorted_vel_ptrs[2] = vel_z;
+        
+        d_sorted_force_ptrs[0] = force_x;
+        d_sorted_force_ptrs[1] = force_y;
+        d_sorted_force_ptrs[2] = force_z;
+    }
+}
+
+// Kernel to initialize device pointer arrays
+__global__ void init_device_pointers(
+    float* bbox_min_x, float* bbox_min_y, float* bbox_min_z,
+    float* bbox_max_x, float* bbox_max_y, float* bbox_max_z,
+    float* center_x, float* center_y, float* center_z)
+{
+    d_bbox_min_ptrs[0] = bbox_min_x;
+    d_bbox_min_ptrs[1] = bbox_min_y;
+    d_bbox_min_ptrs[2] = bbox_min_z;
+    
+    d_bbox_max_ptrs[0] = bbox_max_x;
+    d_bbox_max_ptrs[1] = bbox_max_y;
+    d_bbox_max_ptrs[2] = bbox_max_z;
+    
+    d_center_ptrs[0] = center_x;
+    d_center_ptrs[1] = center_y;
+    d_center_ptrs[2] = center_z;
+}
+
 void lbvh_timestep(
     float* pos[3], float* vel[3],
     uint64_t* morton, int* idx,
@@ -610,23 +681,28 @@ void lbvh_timestep(
     // === 7. Refit internal nodes ===
     int numInternalNodes = nBodies - 1;
     dim3 grid_refit((numInternalNodes + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    printf("Launching refit_bvh_bottom_up with grid=(%d,1,1), block=(%d,1,1), nBodies=%d\n", 
-           grid_refit.x, block.x, nBodies);
     
     // The actual pointers are now managed by the device variables, so we can pass NULL
     // for the pointer arrays since they won't be used
     refit_bvh_bottom_up<<<grid_refit, block>>>(left, right, NULL, NULL, NULL, node_mass, nBodies);
     CHECK_LAST_CUDA_ERROR();
 
-    // === 8. Force calculation (on sorted particles) ===
+    init_particle_pointers<<<1, 1>>>(
+        sorted_pos[0], sorted_pos[1], sorted_pos[2],
+        sorted_vel[0], sorted_vel[1], sorted_vel[2],
+        sorted_force[0], sorted_force[1], sorted_force[2]
+    );
+    CHECK_LAST_CUDA_ERROR();
+
+    // Update the kernel launch to use NULL for the pointer arrays since we're using device variables
     barnes_hut_traverse<<<grid, block>>>(
-        sorted_pos, sorted_vel, sorted_force,
-        left, right, bbox_min, bbox_max, node_mass, center,
-        nBodies, theta);
+        NULL, NULL, NULL,  // These will be accessed through device variables
+        left, right, NULL, NULL, node_mass, NULL,
+        nBodies, theta);    
 		CHECK_LAST_CUDA_ERROR();
 
     // === 9. Integration (on sorted particles) ===
-    integrate_leapfrog<<<grid, block>>>(sorted_pos, sorted_vel, sorted_force, dt, nBodies);
+    integrate_leapfrog<<<grid, block>>>(NULL, NULL, NULL, dt, nBodies);
 		CHECK_LAST_CUDA_ERROR();
 
     // === 10. Scatter: Put data back into original order ===
@@ -709,30 +785,6 @@ void allocate_bvh_arrays(
     // Total mass at each node
     cudaMalloc(node_mass, node_bytes_float);
     cudaMemset(*node_mass, 0, node_bytes_float);
-}
-
-// Device pointers for the arrays of pointers
-__device__ float* d_bbox_min_ptrs[3];
-__device__ float* d_bbox_max_ptrs[3];
-__device__ float* d_center_ptrs[3];
-
-// Initialize device pointer arrays
-__global__ void init_device_pointers(
-    float* bbox_min_x, float* bbox_min_y, float* bbox_min_z,
-    float* bbox_max_x, float* bbox_max_y, float* bbox_max_z,
-    float* center_x, float* center_y, float* center_z)
-{
-    d_bbox_min_ptrs[0] = bbox_min_x;
-    d_bbox_min_ptrs[1] = bbox_min_y;
-    d_bbox_min_ptrs[2] = bbox_min_z;
-    
-    d_bbox_max_ptrs[0] = bbox_max_x;
-    d_bbox_max_ptrs[1] = bbox_max_y;
-    d_bbox_max_ptrs[2] = bbox_max_z;
-    
-    d_center_ptrs[0] = center_x;
-    d_center_ptrs[1] = center_y;
-    d_center_ptrs[2] = center_z;
 }
 
 int main(const int argc, const char** argv) {
