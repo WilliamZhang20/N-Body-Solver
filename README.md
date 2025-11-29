@@ -6,6 +6,7 @@ Problem: plot the motion of $n$ unit masses in 3D space due to their inter-gravi
 - Coalescing global memory access: `nbody_coalesced.cu`
 - Optimizing shared memory: `nbody_sharedMem.cu`
 - Leveraging a Bounding Volume Hierarchy (BVH): `nbody_bvh.cu`
+- Particle Mesh Method with CuFFT: `nbody_particle_mesh.cu`
 
 The BVH implementation is by far the hardest, longest, but most interesting and theory-heavy implementation.
 

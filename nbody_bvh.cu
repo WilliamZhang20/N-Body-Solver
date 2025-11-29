@@ -35,6 +35,15 @@ do {                                                                      \
 // Constants
 #define BLOCK_SIZE 256
 
+// Device pointers for the arrays of pointers
+__device__ float* d_bbox_min_ptrs[3];
+__device__ float* d_bbox_max_ptrs[3];
+__device__ float* d_center_ptrs[3];
+
+__device__ float* d_sorted_pos_ptrs[3];
+__device__ float* d_sorted_vel_ptrs[3];
+__device__ float* d_sorted_force_ptrs[3];
+
 __global__ void integrate_leapfrog(
     float* const* pos,
     float* const* vel,
@@ -44,11 +53,6 @@ __global__ void integrate_leapfrog(
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nBodies) return;
-
-    // Use device pointers
-    extern __device__ float* d_sorted_pos_ptrs[3];
-    extern __device__ float* d_sorted_vel_ptrs[3];
-    extern __device__ float* d_sorted_force_ptrs[3];
 
     // Update velocity (v = v + a*dt)
     d_sorted_vel_ptrs[0][i] += d_sorted_force_ptrs[0][i] * dt;
@@ -100,125 +104,100 @@ bool node_needs_opening(const float3 pos, const float3 node_com,
 }
 
 __global__ void barnes_hut_traverse(
-    const float* const* sorted_pos,   // Will be NULL, using device variables
-    const float* const* sorted_vel,   // Will be NULL, using device variables
-    float* const* sorted_force,       // Will be NULL, using device variables
+    const float* const* sorted_pos,   // NULL - using device variables
+    const float* const* sorted_vel,   // NULL - using device variables
+    float* const* sorted_force,       // NULL - using device variables
     const int* __restrict__ left,
     const int* __restrict__ right,
-    float* const* bbox_min,           // Will be NULL, using device variables
-    float* const* bbox_max,           // Will be NULL, using device variables
+    float* const* bbox_min,           // NULL - using device variables
+    float* const* bbox_max,           // NULL - using device variables
     const float* __restrict__ node_mass,
-    float* const* center,             // Will be NULL, using device variables
+    float* const* center,             // NULL - using device variables
     int nBodies,
     float theta)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nBodies) return;
 
-    // Use device pointers instead of passed-in pointers
-    extern __device__ float* d_sorted_pos_ptrs[3];
-    extern __device__ float* d_sorted_vel_ptrs[3];
-    extern __device__ float* d_sorted_force_ptrs[3];
-    extern __device__ float* d_bbox_min_ptrs[3];
-    extern __device__ float* d_bbox_max_ptrs[3];
-    extern __device__ float* d_center_ptrs[3];
-
     float4 my_pos_mass = make_float4(
         d_sorted_pos_ptrs[0][i],
         d_sorted_pos_ptrs[1][i],
         d_sorted_pos_ptrs[2][i],
-        1.0f  // Assuming unit mass for now
+        1.0f
     );
 
     float3 acc = make_float3(0.0f, 0.0f, 0.0f);
 
-    int stack[64];  // Increased from 32 → safe for 2^20 bodies
+    int stack[64];
     int stack_size = 0;
-    stack[stack_size++] = nBodies;  // root
+    stack[stack_size++] = 2*nBodies - 2;  // root
 
     while (stack_size > 0) {
         int node_idx = stack[--stack_size];
         
-        // Skip if this is the current body
-        if (node_idx < nBodies && node_idx == i) continue;
-
         // Check if this is a leaf node (particle)
         if (node_idx < nBodies) {
-            // Leaf node - calculate direct force
+            // Skip self-interaction
+            if (node_idx == i) continue;
+
+            // Leaf: direct particle-particle interaction
             float3 body_pos = make_float3(
                 d_sorted_pos_ptrs[0][node_idx],
                 d_sorted_pos_ptrs[1][node_idx],
                 d_sorted_pos_ptrs[2][node_idx]
             );
-
-            // Calculate distance between particles
             float3 r = make_float3(
                 body_pos.x - my_pos_mass.x,
                 body_pos.y - my_pos_mass.y,
                 body_pos.z - my_pos_mass.z
             );
-
-            float distSqr = r.x * r.x + r.y * r.y + r.z * r.z + SOFTENING;
+            float distSqr = r.x*r.x + r.y*r.y + r.z*r.z + SOFTENING;
             float invDist = rsqrtf(distSqr);
             float invDist3 = invDist * invDist * invDist;
-
-            // Add contribution to acceleration
             float s = 1.0f * invDist3;
             acc.x += r.x * s;
             acc.y += r.y * s;
             acc.z += r.z * s;
         } else {
-            // Internal node - check if we can approximate
+            // Internal node - FIXED: Use node_idx directly, not (node_idx - nBodies)
             float3 node_center = make_float3(
-                d_center_ptrs[0][node_idx - nBodies],
-                d_center_ptrs[1][node_idx - nBodies],
-                d_center_ptrs[2][node_idx - nBodies]
+                d_center_ptrs[0][node_idx],
+                d_center_ptrs[1][node_idx],
+                d_center_ptrs[2][node_idx]
             );
-
             float3 node_size = make_float3(
-                d_bbox_max_ptrs[0][node_idx - nBodies] - d_bbox_min_ptrs[0][node_idx - nBodies],
-                d_bbox_max_ptrs[1][node_idx - nBodies] - d_bbox_min_ptrs[1][node_idx - nBodies],
-                d_bbox_max_ptrs[2][node_idx - nBodies] - d_bbox_min_ptrs[2][node_idx - nBodies]
+                d_bbox_max_ptrs[0][node_idx] - d_bbox_min_ptrs[0][node_idx],
+                d_bbox_max_ptrs[1][node_idx] - d_bbox_min_ptrs[1][node_idx],
+                d_bbox_max_ptrs[2][node_idx] - d_bbox_min_ptrs[2][node_idx]
             );
-
-            float d = sqrtf(
-                (node_center.x - my_pos_mass.x) * (node_center.x - my_pos_mass.x) +
-                (node_center.y - my_pos_mass.y) * (node_center.y - my_pos_mass.y) +
-                (node_center.z - my_pos_mass.z) * (node_center.z - my_pos_mass.z)
+            float3 r = make_float3(
+                node_center.x - my_pos_mass.x,
+                node_center.y - my_pos_mass.y,
+                node_center.z - my_pos_mass.z
             );
+            float distSqr = r.x*r.x + r.y*r.y + r.z*r.z + SOFTENING;
+            float s = fmaxf(fmaxf(node_size.x, node_size.y), node_size.z);
 
-            float s = max(node_size.x, max(node_size.y, node_size.z));
-
-            // Check if we can approximate this node
-            if (s / d < theta) {
-                // Use center of mass approximation
-                float3 r = make_float3(
-                    node_center.x - my_pos_mass.x,
-                    node_center.y - my_pos_mass.y,
-                    node_center.z - my_pos_mass.z
-                );
-
-                float distSqr = r.x * r.x + r.y * r.y + r.z * r.z + SOFTENING;
-                float invDist = rsqrtf(distSqr);
-                float invDist3 = invDist * invDist * invDist;
-
-                // Add contribution to acceleration
-                float node_mass_val = node_mass[node_idx - nBodies];
-                float s = node_mass_val * invDist3;
-                acc.x += r.x * s;
-                acc.y += r.y * s;
-                acc.z += r.z * s;
-            } else {
-                // Need to process children
+            // Open node if too close/large
+            if (s * s / distSqr > theta * theta || distSqr < SOFTENING * 10.0f) {
                 int l = left[node_idx];
                 int r = right[node_idx];
                 if (r != -1) stack[stack_size++] = r;
                 if (l != -1) stack[stack_size++] = l;
+            } else {
+                // Approximate with center of mass - FIXED: Use node_idx for mass
+                float invDist = rsqrtf(distSqr);
+                float invDist3 = invDist * invDist * invDist;
+                float node_mass_val = node_mass[node_idx];
+                float scalar = node_mass_val * invDist3;
+                acc.x += r.x * scalar;
+                acc.y += r.y * scalar;
+                acc.z += r.z * scalar;
             }
         }
     }
 
-    // Write the acceleration back to global memory
+    // Write acceleration back
     if (i < nBodies) {
         d_sorted_force_ptrs[0][i] = acc.x;
         d_sorted_force_ptrs[1][i] = acc.y;
@@ -229,18 +208,17 @@ __global__ void barnes_hut_traverse(
 __global__ void refit_bvh_bottom_up(
     const int* __restrict__ left_child,
     const int* __restrict__ right_child,
-    float** bbox_min,       // [3] arrays: bbox_min[0][node] = min_x, etc.
-    float** bbox_max,       // [3]
-    float** center,         // [3] center of mass
+    float** bbox_min,
+    float** bbox_max,
+    float** center,
     float* node_mass,
     int nBodies)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nBodies - 1) return;  // nBodies-1 internal nodes
+    if (idx >= nBodies - 1) return;
 
-    int internal_idx = nBodies + idx;  // Internal nodes are at [nBodies, 2*nBodies-2]
+    int internal_idx = nBodies + idx;
 
-    // Get children
     int l = left_child[internal_idx];
     int r = right_child[internal_idx];
 
@@ -252,53 +230,47 @@ __global__ void refit_bvh_bottom_up(
     float3 l_com = make_float3(0.0f, 0.0f, 0.0f);
     float3 r_com = make_float3(0.0f, 0.0f, 0.0f);
 
-    // Get device pointers from the global device variables
-    extern __device__ float* d_bbox_min_ptrs[3];
-    extern __device__ float* d_bbox_max_ptrs[3];
-    extern __device__ float* d_center_ptrs[3];
-
+    // Load left child data - FIXED: Use 'l' directly (already correct index)
     if (l != -1) {
-        int child_l_idx = l; // Use direct index
         l_min = make_float3(
-            d_bbox_min_ptrs[0][child_l_idx],
-            d_bbox_min_ptrs[1][child_l_idx],
-            d_bbox_min_ptrs[2][child_l_idx]
+            d_bbox_min_ptrs[0][l],
+            d_bbox_min_ptrs[1][l],
+            d_bbox_min_ptrs[2][l]
         );
         l_max = make_float3(
-            d_bbox_max_ptrs[0][child_l_idx],
-            d_bbox_max_ptrs[1][child_l_idx],
-            d_bbox_max_ptrs[2][child_l_idx]
+            d_bbox_max_ptrs[0][l],
+            d_bbox_max_ptrs[1][l],
+            d_bbox_max_ptrs[2][l]
         );
         l_com = make_float3(
-            d_center_ptrs[0][child_l_idx],
-            d_center_ptrs[1][child_l_idx],
-            d_center_ptrs[2][child_l_idx]
+            d_center_ptrs[0][l],
+            d_center_ptrs[1][l],
+            d_center_ptrs[2][l]
         );
-        l_mass = node_mass[child_l_idx];
+        l_mass = node_mass[l];
     }
     
-    // --- Conditionally Load Right Child Data ---
+    // Load right child data - FIXED: Use 'r' directly (already correct index)
     if (r != -1) {
-        int child_r_idx = r; // Use direct index
         r_min = make_float3(
-            d_bbox_min_ptrs[0][child_r_idx],
-            d_bbox_min_ptrs[1][child_r_idx],
-            d_bbox_min_ptrs[2][child_r_idx]
+            d_bbox_min_ptrs[0][r],
+            d_bbox_min_ptrs[1][r],
+            d_bbox_min_ptrs[2][r]
         );
         r_max = make_float3(
-            d_bbox_max_ptrs[0][child_r_idx],
-            d_bbox_max_ptrs[1][child_r_idx],
-            d_bbox_max_ptrs[2][child_r_idx]
+            d_bbox_max_ptrs[0][r],
+            d_bbox_max_ptrs[1][r],
+            d_bbox_max_ptrs[2][r]
         );
         r_com = make_float3(
-            d_center_ptrs[0][child_r_idx],
-            d_center_ptrs[1][child_r_idx],
-            d_center_ptrs[2][child_r_idx]
+            d_center_ptrs[0][r],
+            d_center_ptrs[1][r],
+            d_center_ptrs[2][r]
         );
-        r_mass = node_mass[child_r_idx];
+        r_mass = node_mass[r];
     }
 
-    // === Merge AABBs ===
+    // Merge AABBs
     float3 node_min = make_float3(
         fminf(l_min.x, r_min.x),
         fminf(l_min.y, r_min.y),
@@ -311,7 +283,7 @@ __global__ void refit_bvh_bottom_up(
         fmaxf(l_max.z, r_max.z)
     );
 
-    // === Compute total mass and center of mass ===
+    // Compute total mass and center of mass
     float total_mass = l_mass + r_mass;
     float inv_total = (total_mass > 0.0f) ? 1.0f / total_mass : 0.0f;
 
@@ -321,7 +293,7 @@ __global__ void refit_bvh_bottom_up(
         (l_com.z * l_mass + r_com.z * r_mass) * inv_total
     );
 
-    // === Write back to this internal node ===
+    // Write back to this internal node
     d_bbox_min_ptrs[0][internal_idx] = node_min.x;
     d_bbox_min_ptrs[1][internal_idx] = node_min.y;
     d_bbox_min_ptrs[2][internal_idx] = node_min.z;
@@ -335,6 +307,39 @@ __global__ void refit_bvh_bottom_up(
     d_center_ptrs[2][internal_idx] = node_com.z;
 
     node_mass[internal_idx] = total_mass;
+}
+
+void refit_bvh_synchronized(
+    int* left, int* right,
+    float* bbox_min[3], float* bbox_max[3],
+    float* node_mass, float* center[3],
+    int nBodies)
+{
+    // Calculate tree depth
+    int maxDepth = 0;
+    int temp = nBodies - 1;
+    while (temp > 0) {
+        maxDepth++;
+        temp >>= 1;
+    }
+
+    // Process from deepest level to root (bottom-up)
+    // Level 0 = leaves (already initialized)
+    // Level maxDepth = root
+    
+    for (int level = 1; level <= maxDepth; level++) {
+        // Estimate number of nodes at this level
+        // This is approximate since LBVH isn't perfectly balanced
+        int nodesAtLevel = 1 << (maxDepth - level);
+        int grid = (nodesAtLevel + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        
+        // Launch kernel for this level
+        refit_bvh_bottom_up<<<grid, BLOCK_SIZE>>>(
+            left, right, NULL, NULL, NULL, node_mass, nBodies);
+        
+        // CRITICAL: Synchronize before next level
+        cudaDeviceSynchronize();
+    }
 }
 
 __global__ void compute_leaf_aabbs_and_com(
@@ -555,16 +560,6 @@ __global__ void compute_morton_codes(
     morton[idx] = xx | (yy << 1) | (zz << 2);
 }
 
-
-// Device pointers for the arrays of pointers
-__device__ float* d_bbox_min_ptrs[3];
-__device__ float* d_bbox_max_ptrs[3];
-__device__ float* d_center_ptrs[3];
-
-__device__ float* d_sorted_pos_ptrs[3];
-__device__ float* d_sorted_vel_ptrs[3];
-__device__ float* d_sorted_force_ptrs[3];
-
 __global__ void init_particle_pointers(
     float* pos_x, float* pos_y, float* pos_z,
     float* vel_x, float* vel_y, float* vel_z,
@@ -617,18 +612,18 @@ void lbvh_timestep(
     dim3 block(BLOCK_SIZE);
     dim3 grid((nBodies + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
+    // Steps 1-6: Same as before (working correctly)
+    
     // === 1. Compute global bounding box ===
     thrust::device_ptr<float> dpx(pos[0]), dpy(pos[1]), dpz(pos[2]);
     auto minmax_x = thrust::minmax_element(thrust::device, dpx, dpx + nBodies);
     auto minmax_y = thrust::minmax_element(thrust::device, dpy, dpy + nBodies);
     auto minmax_z = thrust::minmax_element(thrust::device, dpz, dpz + nBodies);
 
-    // Fetch to host
     float min_x = *(minmax_x.first),  max_x = *(minmax_x.second);
     float min_y = *(minmax_y.first),  max_y = *(minmax_y.second);
     float min_z = *(minmax_z.first),  max_z = *(minmax_z.second);
 
-    // Expand bounds slightly to prevent 1.0f overflow in Morton code
     float eps = 1e-5f;
     max_x += (max_x - min_x) * eps; min_x -= (max_x - min_x) * eps;
     max_y += (max_y - min_y) * eps; min_y -= (max_y - min_y) * eps;
@@ -641,83 +636,71 @@ void lbvh_timestep(
     CHECK_LAST_CUDA_ERROR();
     
     // === 3. Sort particles by Morton code ===
-    // Reset indices
-    thrust::sequence(thrust::device, thrust::device_pointer_cast(idx), thrust::device_pointer_cast(idx) + nBodies);
-    // Sort keys and move indices
-    thrust::sort_by_key(thrust::device, thrust::device_pointer_cast(morton), thrust::device_pointer_cast(morton) + nBodies, thrust::device_pointer_cast(idx));
+    thrust::sequence(thrust::device, thrust::device_pointer_cast(idx), 
+                    thrust::device_pointer_cast(idx) + nBodies);
+    thrust::sort_by_key(thrust::device, thrust::device_pointer_cast(morton), 
+                       thrust::device_pointer_cast(morton) + nBodies, 
+                       thrust::device_pointer_cast(idx));
 
-    // === 4. Gather: Reorder particle data into scratch buffers ===
+    // === 4. Gather: Reorder particle data ===
     for (int d = 0; d < 3; ++d) {
-        // Reset forces to 0
         cudaMemset(sorted_force[d], 0, nBodies * sizeof(float));
-
-        thrust::gather(thrust::device, thrust::device_pointer_cast(idx), thrust::device_pointer_cast(idx) + nBodies,
-                       thrust::device_pointer_cast(pos[d]), thrust::device_pointer_cast(sorted_pos[d]));
-        
-        thrust::gather(thrust::device, thrust::device_pointer_cast(idx), thrust::device_pointer_cast(idx) + nBodies,
-                       thrust::device_pointer_cast(vel[d]), thrust::device_pointer_cast(sorted_vel[d]));
+        thrust::gather(thrust::device, thrust::device_pointer_cast(idx), 
+                      thrust::device_pointer_cast(idx) + nBodies,
+                      thrust::device_pointer_cast(pos[d]), 
+                      thrust::device_pointer_cast(sorted_pos[d]));
+        thrust::gather(thrust::device, thrust::device_pointer_cast(idx), 
+                      thrust::device_pointer_cast(idx) + nBodies,
+                      thrust::device_pointer_cast(vel[d]), 
+                      thrust::device_pointer_cast(sorted_vel[d]));
     }
 
-    // === 5. Build tree on sorted particles ===
-    build_lbvh_radix_tree<<<grid, block>>>(
-        morton,
-        left, right, 
-        nBodies
-    );
-		CHECK_LAST_CUDA_ERROR();
+    // === 5. Build tree ===
+    build_lbvh_radix_tree<<<grid, block>>>(morton, left, right, nBodies);
+    CHECK_LAST_CUDA_ERROR();
 
-    // === 6. Leaf AABBs and center of mass ===
-    // Assuming unit mass (1.0f)
+    // === 6. Leaf AABBs ===
     compute_leaf_aabbs_and_com<<<grid, block>>>(
         sorted_pos[0], sorted_pos[1], sorted_pos[2],
         bbox_min[0], bbox_min[1], bbox_min[2],
         bbox_max[0], bbox_max[1], bbox_max[2],
-        center[0],   center[1],   center[2],
-        node_mass,
-        nBodies
-    );
+        center[0], center[1], center[2],
+        node_mass, nBodies);
     CHECK_LAST_CUDA_ERROR();
 
-    // === 7. Refit internal nodes ===
-    int numInternalNodes = nBodies - 1;
-    dim3 grid_refit((numInternalNodes + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    
-    // The actual pointers are now managed by the device variables, so we can pass NULL
-    // for the pointer arrays since they won't be used
-    refit_bvh_bottom_up<<<grid_refit, block>>>(left, right, NULL, NULL, NULL, node_mass, nBodies);
-    CHECK_LAST_CUDA_ERROR();
+    // === 7. FIXED: Refit with synchronization ===
+    refit_bvh_synchronized(left, right, bbox_min, bbox_max, 
+                          node_mass, center, nBodies);
 
+    // === 8. Initialize particle pointers ===
     init_particle_pointers<<<1, 1>>>(
         sorted_pos[0], sorted_pos[1], sorted_pos[2],
         sorted_vel[0], sorted_vel[1], sorted_vel[2],
-        sorted_force[0], sorted_force[1], sorted_force[2]
-    );
+        sorted_force[0], sorted_force[1], sorted_force[2]);
     CHECK_LAST_CUDA_ERROR();
 
-    // Update the kernel launch to use NULL for the pointer arrays since we're using device variables
+    // === 9. FIXED: Traverse with correct indexing ===
     barnes_hut_traverse<<<grid, block>>>(
-        NULL, NULL, NULL,  // These will be accessed through device variables
-        left, right, NULL, NULL, node_mass, NULL,
-        nBodies, theta);    
-		CHECK_LAST_CUDA_ERROR();
+        NULL, NULL, NULL, left, right, NULL, NULL, 
+        node_mass, NULL, nBodies, theta);    
+    CHECK_LAST_CUDA_ERROR();
 
-    // === 9. Integration (on sorted particles) ===
+    // === 10. Integration ===
     integrate_leapfrog<<<grid, block>>>(NULL, NULL, NULL, dt, nBodies);
-		CHECK_LAST_CUDA_ERROR();
+    CHECK_LAST_CUDA_ERROR();
 
-    // === 10. Scatter: Put data back into original order ===
+    // === 11. Scatter back ===
     for (int d = 0; d < 3; ++d) {
         thrust::scatter(thrust::device,
-                        thrust::device_pointer_cast(sorted_pos[d]),
-                        thrust::device_pointer_cast(sorted_pos[d]) + nBodies,
-                        thrust::device_pointer_cast(idx),
-                        thrust::device_pointer_cast(pos[d]));
-
+                       thrust::device_pointer_cast(sorted_pos[d]),
+                       thrust::device_pointer_cast(sorted_pos[d]) + nBodies,
+                       thrust::device_pointer_cast(idx),
+                       thrust::device_pointer_cast(pos[d]));
         thrust::scatter(thrust::device,
-                        thrust::device_pointer_cast(sorted_vel[d]),
-                        thrust::device_pointer_cast(sorted_vel[d]) + nBodies,
-                        thrust::device_pointer_cast(idx),
-                        thrust::device_pointer_cast(vel[d]));
+                       thrust::device_pointer_cast(sorted_vel[d]),
+                       thrust::device_pointer_cast(sorted_vel[d]) + nBodies,
+                       thrust::device_pointer_cast(idx),
+                       thrust::device_pointer_cast(vel[d]));
     }
 }
 
